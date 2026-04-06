@@ -1,0 +1,36 @@
+[project]
+name = "autoincrespagent"
+version = "0.1.0"
+description = "AI agentic incident response system using LangGraph and Ollama"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.0.0",
+    "langchain>=1.0.0",
+    "langchain-core>=1.0.0",
+    "langchain-ollama>=1.0.0",
+    "langchain-mcp-adapters>=0.2.0",
+    "mcp>=1.0.0",
+    "aiomysql>=0.2.0",
+    "sqlalchemy>=2.0",
+    "pydantic-settings>=2.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "langchain-community>=0.3.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["autoincrespagent*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

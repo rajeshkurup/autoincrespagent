@@ -14,7 +14,7 @@ _MODEL_MAP: dict[str, str] = {
 }
 
 # Agents that need deterministic JSON output
-_JSON_AGENTS: frozenset[str] = frozenset({"incident_detector", "incident_mitigator"})
+_JSON_AGENTS: frozenset[str] = frozenset({"incident_detector", "root_cause_finder", "incident_mitigator"})
 
 
 def get_llm(agent_name: str, temperature: float = 0.0) -> ChatOllama:

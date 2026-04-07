@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     # Downstream services
     graphserv_url: str = "http://localhost:8080"
     ollama_base_url: str = "http://localhost:11434"
+    qdrant_host: str = "localhost"
+    qdrant_port: int = 6333
 
     # MySQL
     mysql_host: str = "127.0.0.1"

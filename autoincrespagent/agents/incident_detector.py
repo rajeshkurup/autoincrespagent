@@ -144,7 +144,9 @@ def make_incident_detector(tools: list, llm=None) -> Callable:
         }))
 
         return {
-            "phase": "root_cause",
+            "phase": "communicate",
+            "communication_event": "incident_detected",
+            "next_phase": "root_cause",
             "incident_id": incident_id,
             "severity": severity,
             "anomaly_nodes": anomalies,

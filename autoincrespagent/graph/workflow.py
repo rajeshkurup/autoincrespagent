@@ -1,8 +1,8 @@
 """StateGraph assembly.
 
 Wires agent nodes and conditional edges together into a compiled graph.
-Only incident_detector is fully implemented in this phase; the remaining
-nodes are stubs that will be replaced as each phase is built out.
+Implemented agents: incident_detector, root_cause_finder.
+Remaining nodes are stubs that will be replaced as each phase is built out.
 """
 
 import logging
@@ -10,13 +10,18 @@ import logging
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
+from autoincrespagent.agents.incident_communicator import make_incident_communicator
 from autoincrespagent.agents.incident_detector import make_incident_detector
+from autoincrespagent.agents.incident_mitigator import make_incident_mitigator
+from autoincrespagent.agents.incident_summarizer import make_incident_summarizer
+from autoincrespagent.agents.root_cause_finder import make_root_cause_finder
 from autoincrespagent.agents.state import AgentState
 from autoincrespagent.agents.supervisor import supervisor
+from autoincrespagent.vector.qdrant_search import build_embeddings, build_qdrant_client
 
 logger = logging.getLogger(__name__)
 
-# Tool names needed by each agent (for filtering the full tool list)
+# All tool names served by the Graph DB MCP server
 _GRAPH_DB_TOOL_NAMES = {
     "list_anomalies",
     "get_node",
@@ -29,29 +34,6 @@ _GRAPH_DB_TOOL_NAMES = {
     "get_change_tickets",
     "update_node_status",
 }
-
-
-# ── Placeholder nodes for future phases ──────────────────────────────
-
-async def _root_cause_finder_stub(state: AgentState) -> dict:
-    """Placeholder — Phase 2 will replace this with the real agent."""
-    logger.info("root_cause_finder: not yet implemented — ending workflow")
-    return {"phase": "done"}
-
-
-async def _incident_mitigator_stub(state: AgentState) -> dict:
-    logger.info("incident_mitigator: not yet implemented — ending workflow")
-    return {"phase": "done"}
-
-
-async def _incident_communicator_stub(state: AgentState) -> dict:
-    logger.info("incident_communicator: not yet implemented — ending workflow")
-    return {"phase": "done"}
-
-
-async def _incident_summarizer_stub(state: AgentState) -> dict:
-    logger.info("incident_summarizer: not yet implemented — ending workflow")
-    return {"phase": "done"}
 
 
 # ── Graph builder ─────────────────────────────────────────────────────
@@ -69,14 +51,29 @@ def build_graph(all_tools: list, checkpointer=None):
     graph_tools = [t for t in all_tools if t.name in _GRAPH_DB_TOOL_NAMES]
     logger.info(f"build_graph: loaded {len(graph_tools)} graph DB tools")
 
+    # Try to connect to Qdrant; agents skip vector search if unavailable
+    try:
+        qdrant_client = build_qdrant_client()
+        embeddings = build_embeddings()
+        logger.info("build_graph: Qdrant client initialised")
+    except Exception as exc:
+        logger.warning(f"build_graph: Qdrant unavailable ({exc}) — vector search disabled")
+        qdrant_client = None
+        embeddings = None
+
     builder = StateGraph(AgentState)
 
     # ── Nodes ─────────────────────────────────────────────────────────
-    builder.add_node("incident_detector",      make_incident_detector(graph_tools))
-    builder.add_node("root_cause_finder",      _root_cause_finder_stub)
-    builder.add_node("incident_mitigator",     _incident_mitigator_stub)
-    builder.add_node("incident_communicator",  _incident_communicator_stub)
-    builder.add_node("incident_summarizer",    _incident_summarizer_stub)
+    builder.add_node("incident_detector",
+                     make_incident_detector(graph_tools))
+    builder.add_node("root_cause_finder",
+                     make_root_cause_finder(graph_tools, qdrant_client=qdrant_client, embeddings=embeddings))
+    builder.add_node("incident_mitigator",
+                     make_incident_mitigator(qdrant_client=qdrant_client, embeddings=embeddings))
+    builder.add_node("incident_communicator",
+                     make_incident_communicator(qdrant_client=qdrant_client, embeddings=embeddings))
+    builder.add_node("incident_summarizer",
+                     make_incident_summarizer(qdrant_client=qdrant_client, embeddings=embeddings))
 
     # ── Entry point ───────────────────────────────────────────────────
     builder.set_entry_point("incident_detector")

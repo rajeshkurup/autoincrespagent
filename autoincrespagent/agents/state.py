@@ -47,3 +47,9 @@ class AgentState(TypedDict):
     # ── Feedback channel ──────────────────────────────────────────────
     # Set by Mitigator when confidence is low; read by Root Cause Finder.
     feedback_request: Optional[str]
+
+    # ── Communication routing ─────────────────────────────────────────
+    # Set by each agent before routing to "communicate".
+    # communicator prints the event then advances to next_phase.
+    communication_event: Optional[str]   # "incident_detected" | "root_cause_found" | "mitigation_complete"
+    next_phase: Optional[str]            # phase the communicator should advance to after printing

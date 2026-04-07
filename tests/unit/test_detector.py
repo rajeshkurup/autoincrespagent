@@ -102,7 +102,8 @@ class TestIncidentDeclared:
 
         result = await detector(minimal_state)
 
-        assert result["phase"] == "root_cause"
+        assert result["phase"] == "communicate"
+        assert result["next_phase"] == "root_cause"
 
     async def test_incident_id_is_set(self, minimal_state, anomaly_payload):
         tools = _make_tools(anomaly_payload)
@@ -203,7 +204,8 @@ class TestErrorHandling:
 
         # Should not raise; incident is still detected despite ticket failure
         result = await detector(minimal_state)
-        assert result["phase"] == "root_cause"
+        assert result["phase"] == "communicate"
+        assert result["next_phase"] == "root_cause"
 
 
 # ── Factory validation ────────────────────────────────────────────────

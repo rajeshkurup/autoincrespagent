@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     mysql_password: str = ""
     mysql_database: str = "incident_response"
 
+    # MCP server paths
+    mitigationmcpserv_path: str = "../mitigationmcpserv"
+    commsmcpserv_path: str = "../commsmcpserv"
+
     # Agent behaviour
     confidence_threshold: float = 0.75
     max_feedback_iterations: int = 3

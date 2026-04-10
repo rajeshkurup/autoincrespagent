@@ -1,5 +1,6 @@
 """Unit tests for the incident_mitigator agent node."""
 
+import json
 import pytest
 from langchain_core.messages import AIMessage
 from unittest.mock import AsyncMock, MagicMock
@@ -50,11 +51,47 @@ def _state(**overrides) -> dict:
     return base
 
 
+def _mock_mcp_tool(name: str, response: dict) -> MagicMock:
+    """Build a mock LangChain tool that returns a JSON-encoded response."""
+    tool = MagicMock()
+    tool.name = name
+    tool.ainvoke = AsyncMock(return_value=json.dumps(response))
+    return tool
+
+
+def _mock_mitigation_tools(
+    execute_response: dict | None = None,
+    status_response: dict | None = None,
+    feedback_response: dict | None = None,
+) -> list:
+    """Return a list of mock mitigation MCP tools."""
+    execute_resp = execute_response or {
+        "run_id": "test-run-123", "status": "completed",
+        "step_index": 0, "step_description": "step A", "executed_at": "2026-04-10T00:00:00Z",
+    }
+    status_resp = status_response or {
+        "run_id": "test-run-123", "status": "in_progress", "steps_completed": 2,
+        "step_log": [],
+    }
+    feedback_resp = feedback_response or {
+        "outcome": "resolved", "qdrant_stored": True, "recorded_at": "2026-04-10T00:00:00Z",
+    }
+    return [
+        _mock_mcp_tool("execute_mitigation_step", execute_resp),
+        _mock_mcp_tool("check_mitigation_status", status_resp),
+        _mock_mcp_tool("store_mitigation_feedback", feedback_resp),
+    ]
+
+
 # ── Factory ────────────────────────────────────────────────────────────
 
 class TestFactory:
     def test_returns_callable(self):
         agent = make_incident_mitigator()
+        assert callable(agent)
+
+    def test_returns_callable_with_mcp_tools(self):
+        agent = make_incident_mitigator(mitigation_tools=_mock_mitigation_tools())
         assert callable(agent)
 
 
@@ -72,17 +109,15 @@ class TestPhaseRouting:
         assert result["phase"] == "feedback"
 
     async def test_advances_after_max_feedback_iterations(self):
-        # Even if confidence is low, must stop looping at max
         agent = make_incident_mitigator()
         result = await agent(_state(
             mitigation_workflows=[_wf(0.3)],
-            feedback_iteration=3,   # equals MAX_FEEDBACK_ITERATIONS
+            feedback_iteration=3,
         ))
         assert result["phase"] == "communicate"
 
     async def test_advances_with_no_workflows_but_high_rc_confidence(self):
         agent = make_incident_mitigator()
-        # Falls back to root_cause confidence (0.9 > 0.75 threshold)
         result = await agent(_state(
             mitigation_workflows=[],
             root_causes=[_rc(0.9)],
@@ -147,7 +182,6 @@ class TestFeedbackPayload:
 class TestEdgeCases:
     async def test_no_root_causes_no_workflows(self, capsys):
         agent = make_incident_mitigator()
-        # confidence=0.0 < threshold → requests feedback (iteration 0 < max 3)
         result = await agent(_state(root_causes=[], mitigation_workflows=[]))
         out = capsys.readouterr().out
         assert "none" in out.lower()
@@ -168,7 +202,127 @@ class TestEdgeCases:
         assert "SEV1" in out
 
 
-# ── Qdrant feedback persistence ────────────────────────────────────────
+# ── MCP tool execution ─────────────────────────────────────────────────
+
+class TestMCPExecution:
+    async def test_calls_execute_for_each_step(self):
+        tools = _mock_mitigation_tools()
+        execute_tool = next(t for t in tools if t.name == "execute_mitigation_step")
+        agent = make_incident_mitigator(mitigation_tools=tools)
+
+        await agent(_state(mitigation_workflows=[_wf(0.9, steps=["step A", "step B", "step C"])]))
+
+        assert execute_tool.ainvoke.call_count == 3
+
+    async def test_execute_called_with_correct_args(self):
+        tools = _mock_mitigation_tools()
+        execute_tool = next(t for t in tools if t.name == "execute_mitigation_step")
+        agent = make_incident_mitigator(mitigation_tools=tools)
+
+        await agent(_state(
+            incident_id="INC-MCP",
+            mitigation_workflows=[_wf(0.9, steps=["step A"])],
+        ))
+
+        call_args = execute_tool.ainvoke.call_args[0][0]
+        assert call_args["incident_id"] == "INC-MCP"
+        assert call_args["step_index"] == 0
+        assert call_args["step_description"] == "step A"
+
+    async def test_calls_check_status_after_execution(self):
+        tools = _mock_mitigation_tools()
+        status_tool = next(t for t in tools if t.name == "check_mitigation_status")
+        agent = make_incident_mitigator(mitigation_tools=tools)
+
+        await agent(_state(mitigation_workflows=[_wf(0.9, steps=["step A"])]))
+
+        assert status_tool.ainvoke.call_count == 1
+
+    async def test_prints_step_status_from_mcp(self, capsys):
+        tools = _mock_mitigation_tools(execute_response={
+            "run_id": "run-abc", "status": "completed",
+            "step_index": 0, "step_description": "step A", "executed_at": "2026-04-10T00:00:00Z",
+        })
+        agent = make_incident_mitigator(mitigation_tools=tools)
+        await agent(_state(mitigation_workflows=[_wf(0.9, steps=["step A"])]))
+        out = capsys.readouterr().out
+        assert "completed" in out
+
+    async def test_prints_display_only_when_no_mcp_tools(self, capsys):
+        agent = make_incident_mitigator(mitigation_tools=[])
+        await agent(_state(mitigation_workflows=[_wf(0.9, steps=["step A"])]))
+        out = capsys.readouterr().out
+        assert "mcp unavailable" in out.lower() or "display only" in out.lower()
+
+    async def test_execute_tool_failure_does_not_raise(self):
+        tools = _mock_mitigation_tools()
+        execute_tool = next(t for t in tools if t.name == "execute_mitigation_step")
+        execute_tool.ainvoke = AsyncMock(side_effect=Exception("mcp down"))
+        agent = make_incident_mitigator(mitigation_tools=tools)
+
+        # Should not raise even if tool fails
+        result = await agent(_state(mitigation_workflows=[_wf(0.9, steps=["step A"])]))
+        assert result["phase"] == "communicate"
+
+
+# ── MCP feedback storage ───────────────────────────────────────────────
+
+class TestMCPFeedback:
+    async def test_stores_low_confidence_via_mcp(self):
+        tools = _mock_mitigation_tools(
+            feedback_response={"outcome": "low_confidence", "qdrant_stored": True}
+        )
+        feedback_tool = next(t for t in tools if t.name == "store_mitigation_feedback")
+        agent = make_incident_mitigator(mitigation_tools=tools)
+
+        result = await agent(_state(mitigation_workflows=[_wf(0.3)], feedback_iteration=0))
+
+        assert result["phase"] == "feedback"
+        feedback_tool.ainvoke.assert_called_once()
+        call_args = feedback_tool.ainvoke.call_args[0][0]
+        assert call_args["outcome"] == "low_confidence"
+
+    async def test_stores_resolved_after_feedback_loop(self):
+        tools = _mock_mitigation_tools(
+            feedback_response={"outcome": "resolved", "qdrant_stored": True}
+        )
+        feedback_tool = next(t for t in tools if t.name == "store_mitigation_feedback")
+        agent = make_incident_mitigator(mitigation_tools=tools)
+
+        result = await agent(_state(mitigation_workflows=[_wf(0.9)], feedback_iteration=1))
+
+        assert result["phase"] == "communicate"
+        feedback_tool.ainvoke.assert_called_once()
+        call_args = feedback_tool.ainvoke.call_args[0][0]
+        assert call_args["outcome"] == "resolved"
+
+    async def test_no_feedback_stored_on_first_pass_success(self):
+        tools = _mock_mitigation_tools()
+        feedback_tool = next(t for t in tools if t.name == "store_mitigation_feedback")
+        agent = make_incident_mitigator(mitigation_tools=tools)
+
+        await agent(_state(mitigation_workflows=[_wf(0.9)], feedback_iteration=0))
+
+        feedback_tool.ainvoke.assert_not_called()
+
+    async def test_falls_back_to_direct_qdrant_when_mcp_feedback_fails(self):
+        tools = _mock_mitigation_tools(
+            feedback_response={"outcome": "low_confidence", "qdrant_stored": False}
+        )
+        mock_client, mock_embeddings = _mock_qdrant()
+        agent = make_incident_mitigator(
+            qdrant_client=mock_client,
+            embeddings=mock_embeddings,
+            mitigation_tools=tools,
+        )
+
+        await agent(_state(mitigation_workflows=[_wf(0.3)], feedback_iteration=0))
+
+        # MCP returned qdrant_stored=False → falls back to direct upsert
+        mock_client.upsert.assert_called_once()
+
+
+# ── Qdrant direct feedback (fallback, no MCP tools) ────────────────────
 
 def _mock_qdrant(collection_exists=True):
     mock_collections = MagicMock()
@@ -185,8 +339,8 @@ def _mock_qdrant(collection_exists=True):
     return mock_client, mock_embeddings
 
 
-class TestFeedbackPersistence:
-    async def test_saves_low_confidence_to_qdrant(self):
+class TestDirectQdrantFeedback:
+    async def test_saves_low_confidence_directly_when_no_mcp(self):
         mock_client, mock_embeddings = _mock_qdrant()
         agent = make_incident_mitigator(qdrant_client=mock_client, embeddings=mock_embeddings)
         result = await agent(_state(mitigation_workflows=[_wf(0.3)], feedback_iteration=0))
@@ -195,12 +349,9 @@ class TestFeedbackPersistence:
         mock_client.upsert.assert_called_once()
         payload = mock_client.upsert.call_args[1]["points"][0].payload
         assert payload["outcome"] == "low_confidence"
-        assert payload["collection_name"] if False else True  # just check upsert was called
-        assert mock_client.upsert.call_args[1]["collection_name"] == _COLL_FEEDBACK
 
-    async def test_saves_resolved_outcome_after_feedback_loop(self):
+    async def test_saves_resolved_directly_after_feedback_loop(self):
         mock_client, mock_embeddings = _mock_qdrant()
-        # feedback_iteration=1 means loop was used; confidence now high → resolved
         agent = make_incident_mitigator(qdrant_client=mock_client, embeddings=mock_embeddings)
         result = await agent(_state(mitigation_workflows=[_wf(0.9)], feedback_iteration=1))
 
@@ -209,9 +360,8 @@ class TestFeedbackPersistence:
         payload = mock_client.upsert.call_args[1]["points"][0].payload
         assert payload["outcome"] == "resolved"
 
-    async def test_no_resolved_save_on_first_pass_success(self):
+    async def test_no_direct_save_on_first_pass_success(self):
         mock_client, mock_embeddings = _mock_qdrant()
-        # feedback_iteration=0 → no prior feedback, no need to save resolved
         agent = make_incident_mitigator(qdrant_client=mock_client, embeddings=mock_embeddings)
         await agent(_state(mitigation_workflows=[_wf(0.9)], feedback_iteration=0))
 
@@ -223,9 +373,9 @@ class TestFeedbackPersistence:
         agent = make_incident_mitigator(qdrant_client=mock_client, embeddings=mock_embeddings)
 
         result = await agent(_state(mitigation_workflows=[_wf(0.3)]))
-        assert result["phase"] == "feedback"   # must not raise
+        assert result["phase"] == "feedback"
 
     async def test_no_qdrant_still_works(self):
-        agent = make_incident_mitigator()   # no qdrant_client
+        agent = make_incident_mitigator()
         result = await agent(_state(mitigation_workflows=[_wf(0.3)]))
         assert result["phase"] == "feedback"

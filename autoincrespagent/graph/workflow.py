@@ -35,6 +35,24 @@ _GRAPH_DB_TOOL_NAMES = {
     "update_node_status",
 }
 
+# Tool names served by the Mitigation MCP server
+_MITIGATION_TOOL_NAMES = {
+    "search_mitigation_workflows",
+    "execute_mitigation_step",
+    "check_mitigation_status",
+    "store_mitigation_feedback",
+}
+
+# Tool names served by the Communication MCP server
+_COMMS_TOOL_NAMES = {
+    "send_email",
+    "send_slack",
+    "send_teams",
+    "send_sms",
+    "page_oncall",
+    "update_ticket_comms",
+}
+
 
 # ── Graph builder ─────────────────────────────────────────────────────
 
@@ -48,8 +66,12 @@ def build_graph(all_tools: list, checkpointer=None):
     Returns:
         A compiled LangGraph graph ready for ainvoke / astream.
     """
-    graph_tools = [t for t in all_tools if t.name in _GRAPH_DB_TOOL_NAMES]
-    logger.info(f"build_graph: loaded {len(graph_tools)} graph DB tools")
+    graph_tools      = [t for t in all_tools if t.name in _GRAPH_DB_TOOL_NAMES]
+    mitigation_tools = [t for t in all_tools if t.name in _MITIGATION_TOOL_NAMES]
+    comms_tools      = [t for t in all_tools if t.name in _COMMS_TOOL_NAMES]
+    logger.info(f"build_graph: loaded {len(graph_tools)} graph DB tools, "
+                f"{len(mitigation_tools)} mitigation tools, "
+                f"{len(comms_tools)} comms tools")
 
     # Try to connect to Qdrant; agents skip vector search if unavailable
     try:
@@ -69,9 +91,11 @@ def build_graph(all_tools: list, checkpointer=None):
     builder.add_node("root_cause_finder",
                      make_root_cause_finder(graph_tools, qdrant_client=qdrant_client, embeddings=embeddings))
     builder.add_node("incident_mitigator",
-                     make_incident_mitigator(qdrant_client=qdrant_client, embeddings=embeddings))
+                     make_incident_mitigator(qdrant_client=qdrant_client, embeddings=embeddings,
+                                             mitigation_tools=mitigation_tools))
     builder.add_node("incident_communicator",
-                     make_incident_communicator(qdrant_client=qdrant_client, embeddings=embeddings))
+                     make_incident_communicator(qdrant_client=qdrant_client, embeddings=embeddings,
+                                               comms_tools=comms_tools))
     builder.add_node("incident_summarizer",
                      make_incident_summarizer(qdrant_client=qdrant_client, embeddings=embeddings))
 

@@ -1,17 +1,19 @@
-"""Incident Mitigator agent — Phase 3 (mock).
+"""Incident Mitigator agent — Phase 3.
 
 Reads root_causes and mitigation_workflows from state (produced by the
-Root Cause Finder) and prints a structured mitigation plan to stdout.
-No external calls are made — this is a display-only mock that shows
-what a real mitigator would execute.
+Root Cause Finder) and executes mitigation steps via the Mitigation MCP
+server (mitigationmcpserv).
 
-If mitigation_confidence is below CONFIDENCE_THRESHOLD and the feedback
-iteration limit has not been reached, it requests another Root Cause
-Finder pass via phase="feedback" and saves the failed attempt to Qdrant
-so future runs can avoid the same dead ends.
+Each step of the top-ranked workflow is submitted through the
+`execute_mitigation_step` MCP tool, which logs the action and tracks
+run state.  Execution status is verified via `check_mitigation_status`.
 
-When the loop resolves successfully, the winning root cause + workflow
-are also saved to Qdrant feedback_history.
+Feedback loop:
+  - If mitigation_confidence is below CONFIDENCE_THRESHOLD and the
+    feedback iteration limit has not been reached, the agent requests
+    another Root Cause Finder pass (phase="feedback") and stores the
+    failed attempt via `store_mitigation_feedback`.
+  - When the loop resolves, the winning outcome is also stored.
 """
 
 import json
@@ -23,7 +25,6 @@ from typing import Callable, Optional
 from langchain_core.messages import AIMessage
 from langchain_ollama import OllamaEmbeddings
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from autoincrespagent.agents.state import AgentState
 from autoincrespagent.config import settings
@@ -38,19 +39,60 @@ def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-async def _save_feedback(
+def _get_tool(tools: list, name: str):
+    """Return the LangChain tool with the given name, or None."""
+    return next((t for t in tools if t.name == name), None)
+
+
+async def _call_tool(tools: list, name: str, args: dict) -> dict | None:
+    """Invoke a mitigation MCP tool and parse the JSON response.
+
+    Returns the parsed dict, or None on any failure.
+    """
+    tool = _get_tool(tools, name)
+    if not tool:
+        logger.warning(f"incident_mitigator: tool '{name}' not available")
+        return None
+    try:
+        raw = await tool.ainvoke(args)
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        logger.warning(f"incident_mitigator: tool '{name}' failed — {exc}")
+        return None
+
+
+async def _mcp_store_feedback(
+    tools: list,
+    incident_id: str,
+    workflow_id: str,
+    run_id: str,
+    outcome: str,
+    query_text: str,
+    notes: str = "",
+) -> bool:
+    """Store feedback via the MCP store_mitigation_feedback tool."""
+    result = await _call_tool(tools, "store_mitigation_feedback", {
+        "incident_id": incident_id,
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "outcome": outcome,
+        "notes": notes,
+        "query_text": query_text,
+    })
+    return bool(result and result.get("qdrant_stored"))
+
+
+async def _direct_store_feedback(
     qdrant_client: AsyncQdrantClient,
     embeddings: OllamaEmbeddings,
     state: AgentState,
-    outcome: str,          # "low_confidence" | "resolved"
+    outcome: str,
     confidence: float,
     feedback_msg: str = "",
 ) -> None:
-    """Upsert a feedback episode into the feedback_history collection.
+    """Fallback: store feedback directly to Qdrant when MCP is unavailable."""
+    from qdrant_client.models import Distance, PointStruct, VectorParams
 
-    outcome="low_confidence" — hypothesis failed, feedback requested.
-    outcome="resolved"       — loop resolved; records what ultimately worked.
-    """
     incident_id = state.get("incident_id", "UNKNOWN")
     severity    = state.get("severity", "UNKNOWN")
     root_causes = state.get("root_causes", [])
@@ -72,18 +114,15 @@ async def _save_feedback(
     )
 
     try:
-        # Ensure collection exists (created lazily on first feedback save)
         existing = [c.name for c in (await qdrant_client.get_collections()).collections]
         if _COLL_FEEDBACK not in existing:
             await qdrant_client.create_collection(
                 collection_name=_COLL_FEEDBACK,
                 vectors_config=VectorParams(size=768, distance=Distance.COSINE),
             )
-            logger.info(f"incident_mitigator: created collection '{_COLL_FEEDBACK}'")
-
         vector = await embeddings.aembed_query(text)
         point  = PointStruct(
-            id=str(uuid.uuid4()),   # unique per episode — never overwrite
+            id=str(uuid.uuid4()),
             vector=vector,
             payload={
                 "incident_id":    incident_id,
@@ -102,36 +141,41 @@ async def _save_feedback(
         )
         await qdrant_client.upsert(collection_name=_COLL_FEEDBACK, points=[point])
         logger.info(json.dumps({
-            "agent": "incident_mitigator", "event": "feedback_saved",
-            "outcome": outcome, "incident_id": incident_id, "iteration": iteration,
+            "agent": "incident_mitigator", "event": "feedback_saved_direct",
+            "outcome": outcome, "incident_id": incident_id,
         }))
     except Exception as exc:
-        logger.warning(f"incident_mitigator: feedback Qdrant save failed ({exc}) — continuing")
+        logger.warning(f"incident_mitigator: direct Qdrant feedback save failed ({exc})")
 
 
 def make_incident_mitigator(
     qdrant_client: Optional[AsyncQdrantClient] = None,
     embeddings: Optional[OllamaEmbeddings] = None,
+    mitigation_tools: Optional[list] = None,
 ) -> Callable:
     """Return the incident_mitigator node function.
 
     Args:
-        qdrant_client: Optional AsyncQdrantClient — enables feedback persistence.
-        embeddings:    Optional OllamaEmbeddings  — required when qdrant_client is set.
+        qdrant_client:    Optional AsyncQdrantClient — fallback feedback persistence.
+        embeddings:       Optional OllamaEmbeddings  — required for fallback path.
+        mitigation_tools: LangChain tools from mitigationmcpserv — enables real
+                          step execution and MCP-based feedback storage.
     """
+    _tools = mitigation_tools or []
 
     async def incident_mitigator(state: AgentState) -> dict:
-        session_id      = state.get("session_id", "unknown")
-        incident_id     = state.get("incident_id", "UNKNOWN")
-        severity        = state.get("severity", "UNKNOWN")
-        root_causes     = state.get("root_causes") or []
-        workflows       = state.get("mitigation_workflows") or []
-        feedback_iter   = state.get("feedback_iteration", 0)
+        session_id    = state.get("session_id", "unknown")
+        incident_id   = state.get("incident_id", "UNKNOWN")
+        severity      = state.get("severity", "UNKNOWN")
+        root_causes   = state.get("root_causes") or []
+        workflows     = state.get("mitigation_workflows") or []
+        feedback_iter = state.get("feedback_iteration", 0)
 
         logger.info(json.dumps({
             "agent": "incident_mitigator", "event": "start",
             "incident_id": incident_id, "root_causes": len(root_causes),
             "workflows": len(workflows), "feedback_iteration": feedback_iter,
+            "mcp_tools_available": len(_tools),
             "session_id": session_id,
         }))
 
@@ -195,21 +239,78 @@ def make_incident_mitigator(
 
         print(f"\n[CONFIDENCE]  {confidence:.2f}  (threshold: {threshold})")
 
-        # ── Simulate step execution ───────────────────────────────────
+        # ── Execute top workflow via MCP (or print if no tools) ───────
+        run_id      = str(uuid.uuid4())
+        query_text  = ""
+        top_wf_id   = ""
+
         if workflows:
-            top_wf  = workflows[0]
-            payload = top_wf.get("payload", top_wf)
-            steps   = payload.get("steps", [])
-            print("\n[MOCK EXECUTION — top workflow]")
-            if steps:
-                for j, step in enumerate(steps, 1):
-                    print(f"  ✓ step {j}: {step}  [simulated OK]")
+            top_wf      = workflows[0]
+            payload     = top_wf.get("payload", top_wf)
+            steps       = payload.get("steps", [])
+            top_wf_id   = payload.get("workflow_id", payload.get("id", "WF-UNKNOWN"))
+            wf_title    = payload.get("title", "Untitled workflow")
+
+            # Build query text from top root cause for embedding in feedback
+            if root_causes:
+                rc = root_causes[0]
+                query_text = (
+                    f"{rc.get('hypothesis', '')} "
+                    f"node {rc.get('node_id', '')} type {rc.get('node_type', '')}"
+                ).strip()
+
+            execute_tool = _get_tool(_tools, "execute_mitigation_step")
+
+            if execute_tool:
+                print(f"\n[EXECUTING — {top_wf_id}: {wf_title}]")
+                if steps:
+                    for j, step in enumerate(steps):
+                        args = {
+                            "incident_id":     incident_id,
+                            "workflow_id":     top_wf_id,
+                            "step_index":      j,
+                            "step_description": step,
+                            "run_id":          run_id,
+                        }
+                        result = await _call_tool(_tools, "execute_mitigation_step", args)
+                        if result:
+                            status = result.get("status", "unknown")
+                            print(f"  step {j + 1}: {step}  [{status}]")
+                        else:
+                            print(f"  step {j + 1}: {step}  [tool error — logged]")
+
+                    # Verify final run status
+                    status_result = await _call_tool(
+                        _tools, "check_mitigation_status", {"run_id": run_id}
+                    )
+                    if status_result:
+                        completed = status_result.get("steps_completed", "?")
+                        print(f"\n  Run {run_id}: {completed}/{len(steps)} steps completed")
+                else:
+                    print("  (no steps defined in workflow)")
             else:
-                print("  (no steps to execute)")
+                # MCP tool not available — print only
+                print(f"\n[EXECUTION — {top_wf_id}: {wf_title}]  (MCP unavailable — display only)")
+                for j, step in enumerate(steps, 1):
+                    print(f"  step {j}: {step}")
         else:
-            print("\n[MOCK EXECUTION]  No workflow selected — skipping.")
+            print("\n[EXECUTION]  No workflow selected — skipping.")
 
         print(f"\n{_LINE}\n")
+
+        # ── Helper: store feedback via MCP or direct Qdrant ───────────
+        async def _store_feedback(outcome: str, notes: str = "") -> None:
+            stored = False
+            if _tools:
+                stored = await _mcp_store_feedback(
+                    _tools, incident_id, top_wf_id, run_id,
+                    outcome, query_text, notes,
+                )
+            if not stored and qdrant_client and embeddings:
+                await _direct_store_feedback(
+                    qdrant_client, embeddings, state,
+                    outcome=outcome, confidence=confidence, feedback_msg=notes,
+                )
 
         # ── Feedback loop or advance ──────────────────────────────────
         if confidence < threshold and feedback_iter < max_iter:
@@ -225,14 +326,7 @@ def make_incident_mitigator(
                 "session_id": session_id,
             }))
 
-            # Save failed attempt to Qdrant so future runs avoid this dead end
-            if qdrant_client and embeddings:
-                await _save_feedback(
-                    qdrant_client, embeddings, state,
-                    outcome="low_confidence",
-                    confidence=confidence,
-                    feedback_msg=feedback_msg,
-                )
+            await _store_feedback("low_confidence", feedback_msg)
 
             return {
                 "phase": "feedback",
@@ -246,16 +340,12 @@ def make_incident_mitigator(
         logger.info(json.dumps({
             "agent": "incident_mitigator", "event": "complete",
             "confidence": confidence, "feedback_iterations": feedback_iter,
+            "run_id": run_id,
             "session_id": session_id,
         }))
 
-        # Save winning outcome to Qdrant when feedback loop was used
-        if qdrant_client and embeddings and feedback_iter > 0:
-            await _save_feedback(
-                qdrant_client, embeddings, state,
-                outcome="resolved",
-                confidence=confidence,
-            )
+        if feedback_iter > 0:
+            await _store_feedback("resolved")
 
         summary = (
             f"Mitigation plan for {incident_id} ({severity}): "

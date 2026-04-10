@@ -7,6 +7,7 @@ AI-driven incident response agent built with LangGraph and Ollama. Monitors infr
 ## Table of Contents
 
 - [Architecture](#architecture)
+- [MCP Servers](#mcp-servers)
 - [Agent Pipeline](#agent-pipeline)
 - [Data Flow](#data-flow)
 - [Qdrant Vector Collections](#qdrant-vector-collections)
@@ -36,7 +37,7 @@ AI-driven incident response agent built with LangGraph and Ollama. Monitors infr
 │            └────────┬──────────┘                                           │
 │                     │ phase="communicate" (incident_detected)              │
 │            ┌────────▼──────────┐                                           │
-│            │incident_communicator│ ◄── mock (print only)                  │
+│            │incident_communicator│ ◄── commsmcpserv           [Comms]     │
 │            └────────┬──────────┘                                           │
 │                     │ next_phase="root_cause"                              │
 │            ┌────────▼──────────┐                                           │
@@ -44,11 +45,11 @@ AI-driven incident response agent built with LangGraph and Ollama. Monitors infr
 │            └────────┬──────────┘                                           │
 │                     │ phase="communicate" (root_cause_found)               │
 │            ┌────────▼──────────┐                                           │
-│            │incident_communicator│                                         │
+│            │incident_communicator│ ◄── commsmcpserv                       │
 │            └────────┬──────────┘                                           │
 │                     │ next_phase="mitigate"                                │
 │            ┌────────▼──────────┐                                           │
-│            │ incident_mitigator │ ◄── mock (print + Qdrant) [Phase 3]    │
+│            │ incident_mitigator │ ◄── mitigationmcpserv      [Phase 3]    │
 │            └────────┬──────────┘                                           │
 │               ▲     │                                                       │
 │               │     │ [confidence < threshold & iter < max]               │
@@ -67,15 +68,107 @@ AI-driven incident response agent built with LangGraph and Ollama. Monitors infr
 │            └────────┬──────────┘                                           │
 │                     │ END                                                  │
 └─────────────────────────────────────────────────────────────────────────────┘
-         │                              │
-         ▼                              ▼
-  Graph DB MCP                    Qdrant (5 collections)
-  (graphmcpserv)                  MySQL (checkpoints)
-         │
-         ▼
-  graphserv :8080
-  (Neo4j topology)
+         │                    │                    │
+         ▼                    ▼                    ▼
+  graphmcpserv         mitigationmcpserv      commsmcpserv
+  (Neo4j topology)     (workflow execution)   (notifications)
+         │                    │                    │
+         ▼                    ▼                    ▼
+  graphserv :8080        Qdrant                log files
+  (Neo4j)          mitigation_workflows     email/slack/teams/
+                   feedback_history         sms/pagerduty
 ```
+
+---
+
+## MCP Servers
+
+Three MCP servers are spawned automatically as subprocesses when the agent starts. Each exposes typed tools over stdio transport — agents call them via `langchain-mcp-adapters` exactly like any other LangChain tool.
+
+```
+trigger.py
+  └── MultiServerMCPClient.get_tools()
+        ├── spawns: python -m mcp_servers.graph_db.server     (graphmcpserv)
+        ├── spawns: python -m mcp_servers.mitigation.server   (mitigationmcpserv)
+        └── spawns: python -m mcp_servers.comms.server        (commsmcpserv)
+```
+
+### graphmcpserv — Graph DB MCP Server
+
+**Location:** `../graphmcpserv`  **Tools:** 10
+
+Wraps the graphserv REST API so agents never touch Neo4j directly.
+
+| Tool | Purpose |
+|------|---------|
+| `list_anomalies` | Fetch active anomalies |
+| `get_node` | Fetch a single node by label + ID |
+| `root_cause_analysis` | Downstream graph traversal |
+| `blast_radius` | Dependent service count |
+| `get_relationships` | Traverse edges from a node |
+| `create_incident_ticket` | Write IncidentTicket to Neo4j |
+| `link_incident_to_node` | Create IMPACTS relationship |
+| `get_rca_tickets` | Historical RCA records |
+| `get_change_tickets` | Recent change events |
+| `update_node_status` | PATCH node status |
+
+**Used by:** incident_detector, root_cause_finder
+
+---
+
+### mitigationmcpserv — Mitigation Services MCP Server
+
+**Location:** `../mitigationmcpserv`  **Tools:** 4
+
+Provides semantic workflow search (via Qdrant) and stub step execution. All tools work offline — Qdrant search falls back to a built-in mock catalogue of 5 workflows when the collection is empty or unreachable.
+
+| Tool | Purpose |
+|------|---------|
+| `search_mitigation_workflows` | Semantic search in Qdrant `mitigation_workflows` — returns top-k workflows with steps and confidence scores |
+| `execute_mitigation_step` | Stub executor — logs each step to `logs/mitigation_runs.log` and tracks run state in memory |
+| `check_mitigation_status` | Returns current execution status of a workflow run |
+| `store_mitigation_feedback` | Upserts outcome feedback into Qdrant `feedback_history` |
+
+**Used by:** incident_mitigator
+
+**Execution flow:**
+```
+incident_mitigator
+  │  top workflow selected (score=0.87)
+  ├── execute_mitigation_step(step_index=0, "Check active connection count")  → run_id=abc123
+  ├── execute_mitigation_step(step_index=1, "Increase max_connections", run_id=abc123)
+  ├── execute_mitigation_step(step_index=2, "Restart application pods", run_id=abc123)
+  ├── check_mitigation_status(run_id=abc123)  → 3/3 steps completed
+  └── store_mitigation_feedback(outcome="resolved", run_id=abc123)   [if feedback loop was used]
+```
+
+---
+
+### commsmcpserv — Communication Services MCP Server
+
+**Location:** `../commsmcpserv`  **Tools:** 6
+
+All tools are stubs that write structured JSON to log files and print to stdout. Swap any stub for a real backend (SMTP, Slack webhook, Twilio, PagerDuty Events v2) without changing tool schemas or agent code.
+
+| Tool | Channel | Log file |
+|------|---------|----------|
+| `send_email` | Email (SMTP) | `logs/email_outbox.log` |
+| `send_slack` | Slack webhook | `logs/slack_outbox.log` |
+| `send_teams` | MS Teams webhook | `logs/teams_outbox.log` |
+| `send_sms` | SMS (Twilio) | `logs/sms_outbox.log` |
+| `page_oncall` | PagerDuty | `logs/pagerduty_outbox.log` |
+| `update_ticket_comms` | Incident ticket (ITSM) | `logs/ticket_comms.log` |
+
+**Used by:** incident_communicator
+
+**Channel selection by severity:**
+
+| Severity | Channels dispatched |
+|----------|---------------------|
+| SEV1 | `page_oncall` + `send_slack` + `send_email` |
+| SEV2 | `send_slack` + `send_teams` + `send_email` |
+| SEV3 | `send_email` + `send_teams` |
+| SEV4 | `send_email` |
 
 ---
 
@@ -87,55 +180,60 @@ AI-driven incident response agent built with LangGraph and Ollama. Monitors infr
 trigger.py
     │
     ▼
-incident_detector ─────────────────────────────────────────────────────┐
-    │  • polls graphserv for active anomalies                           │
-    │  • LLM classifies anomalies → incident / no-incident             │
-    │  • creates IncidentTicket in Neo4j                                │
-    │  • sets: incident_id, severity, anomaly_nodes                     │
-    │  phase="communicate", event="incident_detected"                   │
-    ▼                                                                   │
-incident_communicator                                                   │
-    │  🚨 prints INCIDENT DECLARED banner                               │
-    │  • upserts partial summary to Qdrant incident_summaries           │
-    │  next_phase="root_cause"                                          │
-    ▼                                                                   │
-root_cause_finder                                                       │
-    │  • graph traversal: get_relationships → root_cause_analysis       │
-    │  •                  blast_radius, get_change_tickets              │
-    │  •                  get_rca_tickets                               │
-    │  • Qdrant search: rca_documents, change_context,                  │
-    │                   incident_summaries, feedback_history            │
-    │  • LLM synthesises → ranked hypotheses                            │
-    │  • Qdrant search: mitigation_workflows (top hypothesis)           │
-    │  • sets: root_causes, mitigation_workflows                        │
-    │  phase="communicate", event="root_cause_found"                   │
-    ▼                                                                   │
-incident_communicator                                                   │
-    │  🔍 prints ROOT CAUSE IDENTIFIED banner                           │
-    │  • upserts partial summary to Qdrant incident_summaries           │
-    │  next_phase="mitigate"                                            │
-    ▼                                                                   │
-incident_mitigator                                                      │
-    │  • prints root causes + workflow steps                            │
-    │  • simulates step execution (mock)                                │
-    │  • computes confidence from top workflow score                    │
-    │  ┌─ if confidence < threshold AND iter < max ──────────────────┐  │
-    │  │  • saves low_confidence episode → Qdrant feedback_history   │  │
-    │  │  phase="feedback" → back to root_cause_finder               │  │
-    │  └─────────────────────────────────────────────────────────────┘  │
-    │  • if resolved after feedback: saves resolved → feedback_history  │
-    │  phase="communicate", event="mitigation_complete"                │
-    ▼                                                                   │
-incident_communicator                                                   │
-    │  🔧 prints MITIGATION EXECUTED banner                             │
-    │  • upserts partial summary to Qdrant incident_summaries           │
-    │  next_phase="summarize"                                           │
-    ▼                                                                   │
-incident_summarizer                                                     │
-    │  • composes full incident summary from state                      │
-    │  • prints 📋 INCIDENT SUMMARY                                     │
-    │  • upserts final summary → Qdrant incident_summaries             │
-    │  • sets: incident_summary, phase="done"                           │
+incident_detector
+    │  • polls graphserv for active anomalies via list_anomalies
+    │  • LLM classifies anomalies → incident / no-incident
+    │  • creates IncidentTicket in Neo4j via create_incident_ticket
+    │  • sets: incident_id, severity, anomaly_nodes
+    │  phase="communicate", event="incident_detected"
+    ▼
+incident_communicator  (event: incident_detected)
+    │  • SEV2 → send_slack + send_teams + send_email via commsmcpserv
+    │  • update_ticket_comms(event="incident_detected", channels=[...])
+    │  • upserts partial summary → Qdrant incident_summaries
+    │  • prints 🚨 INCIDENT DECLARED banner
+    │  next_phase="root_cause"
+    ▼
+root_cause_finder
+    │  • graph traversal: get_relationships → root_cause_analysis
+    │  •                  blast_radius, get_change_tickets, get_rca_tickets
+    │  • Qdrant search: rca_documents, change_context,
+    │                   incident_summaries, feedback_history
+    │  • LLM synthesises → ranked hypotheses
+    │  • Qdrant search: mitigation_workflows (top hypothesis)
+    │  • sets: root_causes, mitigation_workflows
+    │  phase="communicate", event="root_cause_found"
+    ▼
+incident_communicator  (event: root_cause_found)
+    │  • SEV2 → send_slack + send_teams + send_email via commsmcpserv
+    │  • update_ticket_comms(event="root_cause_found", channels=[...])
+    │  • upserts partial summary → Qdrant incident_summaries
+    │  • prints 🔍 ROOT CAUSE IDENTIFIED banner
+    │  next_phase="mitigate"
+    ▼
+incident_mitigator
+    │  • calls execute_mitigation_step for each step of top workflow
+    │  • calls check_mitigation_status to verify run
+    │  • computes confidence from top workflow score
+    │  ┌─ if confidence < threshold AND iter < max ─────────────────────┐
+    │  │  • store_mitigation_feedback(outcome="low_confidence")         │
+    │  │  phase="feedback" → back to root_cause_finder                  │
+    │  └────────────────────────────────────────────────────────────────┘
+    │  • if resolved after feedback: store_mitigation_feedback("resolved")
+    │  phase="communicate", event="mitigation_complete"
+    ▼
+incident_communicator  (event: mitigation_complete)
+    │  • SEV2 → send_slack + send_teams + send_email via commsmcpserv
+    │  • update_ticket_comms(event="mitigation_complete", channels=[...])
+    │  • upserts partial summary → Qdrant incident_summaries
+    │  • prints 🔧 MITIGATION EXECUTED banner
+    │  next_phase="summarize"
+    ▼
+incident_summarizer
+    │  • composes full incident summary from state
+    │  • prints 📋 INCIDENT SUMMARY
+    │  • upserts final summary → Qdrant incident_summaries (overwrites partials)
+    │  • sets: incident_summary, phase="done"
     ▼
   END
 ```
@@ -145,13 +243,12 @@ incident_summarizer                                                     │
 ```
 incident_mitigator
     │  confidence=0.42 < threshold=0.75, iter=0 < max=3
-    │  saves {outcome="low_confidence", hypothesis="...", confidence=0.42}
-    │         → Qdrant feedback_history
+    │  store_mitigation_feedback(outcome="low_confidence") → Qdrant + log
     │  phase="feedback"
     ▼
 root_cause_finder  (second pass)
     │  reads feedback_request: "Widen analysis — check upstream..."
-    │  reads feedback_history from Qdrant → LLM told to avoid dead ends
+    │  searches feedback_history → avoids dead-end hypotheses
     │  produces new hypotheses, fetches new workflows
     │  phase="communicate", event="root_cause_found"
     ▼
@@ -159,8 +256,7 @@ incident_communicator → next_phase="mitigate"
     ▼
 incident_mitigator
     │  confidence=0.83 >= threshold=0.75
-    │  saves {outcome="resolved", hypothesis="...", confidence=0.83}
-    │         → Qdrant feedback_history
+    │  store_mitigation_feedback(outcome="resolved") → Qdrant + log
     │  phase="communicate", event="mitigation_complete"
     ▼
   (continues to summarizer)
@@ -185,14 +281,14 @@ incident_mitigator
     root_cause_finder ────┤ reads all 5 cols  │
                           │                   │
     incident_communicator ┼───────────────────┤ writes incident_summaries
-                          │                   │  (after each event)
+                          │                   │  (after each of 3 events)
     incident_mitigator ───┼───────────────────┤ writes feedback_history
-                          │                   │  (on feedback + resolve)
+      (via mitigationmcpserv)                 │  (via store_mitigation_feedback)
     incident_summarizer ──┼───────────────────┤ writes incident_summaries
                           │                   │  (final authoritative upsert)
 ```
 
-### Neo4j read/write via graphmcpserv MCP
+### Neo4j read/write via graphmcpserv
 
 ```
   incident_detector  ──► list_anomalies
@@ -203,6 +299,28 @@ incident_mitigator
                      ──► blast_radius           (dependent service count)
                      ──► get_change_tickets     (recent change events)
                      ──► get_rca_tickets        (historical RCA records)
+```
+
+### Mitigation execution via mitigationmcpserv
+
+```
+  incident_mitigator ──► execute_mitigation_step  (one call per step)
+                     ──► check_mitigation_status  (verify run after steps)
+                     ──► store_mitigation_feedback (feedback + resolved)
+                              │
+                              ▼
+                     logs/mitigation_runs.log   +   Qdrant feedback_history
+```
+
+### Communication dispatch via commsmcpserv
+
+```
+  incident_communicator ──► send_email        → logs/email_outbox.log
+                        ──► send_slack        → logs/slack_outbox.log
+                        ──► send_teams        → logs/teams_outbox.log
+                        ──► send_sms          → logs/sms_outbox.log
+                        ──► page_oncall       → logs/pagerduty_outbox.log
+                        ──► update_ticket_comms → logs/ticket_comms.log
 ```
 
 ### MySQL (LangGraph checkpoints)
@@ -222,10 +340,11 @@ Each completed run enriches Qdrant so subsequent runs are smarter:
 ```
 Run N completes
     │
-    ├── incident_summaries ◄── communicator (3 partial upserts)
-    │                      ◄── summarizer   (1 final upsert, same point ID)
+    ├── incident_summaries ◄── communicator (3 partial upserts, same point ID)
+    │                      ◄── summarizer   (1 final upsert, overwrites partials)
     │
-    └── feedback_history   ◄── mitigator    (low_confidence + resolved episodes)
+    └── feedback_history   ◄── mitigator via mitigationmcpserv
+                                (low_confidence + resolved episodes, unique UUIDs)
 
 Run N+1 starts
     │
@@ -241,11 +360,11 @@ Run N+1 starts
 
 | Collection | Written by | Read by | Purpose |
 |---|---|---|---|
-| `mitigation_workflows` | seed_data.py | root_cause_finder | Runbook steps per node type |
+| `mitigation_workflows` | seed_data.py | root_cause_finder, mitigationmcpserv | Runbook steps per node type |
 | `rca_documents` | seed_data.py | root_cause_finder | Past RCA write-ups |
 | `change_context` | seed_data.py | root_cause_finder | Recent deploy / config changes |
 | `incident_summaries` | communicator, summarizer | root_cause_finder | Progressive incident record |
-| `feedback_history` | mitigator | root_cause_finder | Low-confidence + resolved feedback episodes |
+| `feedback_history` | mitigationmcpserv | root_cause_finder | Low-confidence + resolved feedback episodes |
 
 All collections use **768-dim cosine similarity** vectors via `nomic-embed-text` (Ollama).
 
@@ -270,7 +389,7 @@ All agents read and write a single `AgentState` TypedDict:
 | `root_causes` | `list[dict]` | Root Cause Finder |
 | `mitigation_workflows` | `list[dict]` | Root Cause Finder |
 | `mitigation_confidence` | `float` | Incident Mitigator |
-| `communications_sent` | `list[dict]` | reserved |
+| `communications_sent` | `list[dict]` | Incident Communicator (one record per event) |
 | `incident_summary` | `str` | Incident Summarizer |
 | `messages` | `Annotated[list, add_messages]` | All agents (accumulates) |
 | `feedback_request` | `str` | Mitigator → Root Cause Finder |
@@ -287,7 +406,7 @@ Before routing to `phase="communicate"`, every agent sets two extra fields:
 | `"root_cause_found"` | root_cause_finder | `"mitigate"` |
 | `"mitigation_complete"` | incident_mitigator | `"summarize"` |
 
-The communicator reads both, prints the appropriate banner, then returns `phase=next_phase`.
+The communicator reads both, dispatches notifications, then returns `phase=next_phase`.
 
 ---
 
@@ -313,8 +432,8 @@ The supervisor is a **deterministic routing function** (no LLM calls). It reads 
 
 **Model:** Qwen 2.5 7B (`qwen2.5:7b`, `format=json`)
 
-**MCP tools used:**
-- `list_anomalies` — fetches active anomalies from Neo4j via graphserv
+**MCP tools used (graphmcpserv):**
+- `list_anomalies` — fetches active anomalies from Neo4j
 - `create_incident_ticket` — writes an `IncidentTicket` node to Neo4j
 
 **Logic:**
@@ -331,16 +450,26 @@ The supervisor is a **deterministic routing function** (no LLM calls). It reads 
 
 **Model:** none (deterministic, no LLM)
 
+**MCP tools used (commsmcpserv):** `send_email`, `send_slack`, `send_teams`, `send_sms`, `page_oncall`, `update_ticket_comms`
+
 **Called after:** incident_detected · root_cause_found · mitigation_complete
 
 **Logic:**
 1. Reads `communication_event` and `next_phase` from state
-2. Prints a formatted banner to stdout based on the event type:
-   - `incident_detected` → 🚨 INCIDENT DECLARED (incident ID, severity, anomaly list, reason)
-   - `root_cause_found`  → 🔍 ROOT CAUSE IDENTIFIED (top hypothesis, confidence, workflow count)
-   - `mitigation_complete` → 🔧 MITIGATION EXECUTED (workflow applied, steps, confidence)
-3. Upserts rolling partial summary to Qdrant `incident_summaries` (best-effort)
-4. Returns `phase=next_phase`, clears `communication_event` and `next_phase`
+2. Selects channels based on `severity`:
+   - SEV1 → `page_oncall` + `send_slack` + `send_email`
+   - SEV2 → `send_slack` + `send_teams` + `send_email`
+   - SEV3 → `send_email` + `send_teams`
+   - SEV4 → `send_email`
+3. Builds event-appropriate subject/title/body from state
+4. Dispatches to each selected channel via commsmcpserv tools
+5. Calls `update_ticket_comms` with event type + list of channels dispatched
+6. Upserts rolling partial summary to Qdrant `incident_summaries` (best-effort)
+7. Prints formatted banner to stdout (🚨 / 🔍 / 🔧)
+8. Appends record to `communications_sent` in state
+9. Returns `phase=next_phase`, clears `communication_event` and `next_phase`
+
+**Graceful degradation:** if a channel tool fails, remaining channels still dispatch. Falls back to print-only mode if no comms tools are wired.
 
 **Qdrant writes:** `incident_summaries` (deterministic point ID — same doc updated 3×)
 
@@ -350,7 +479,7 @@ The supervisor is a **deterministic routing function** (no LLM calls). It reads 
 
 **Model:** Llama 3.1 8B (`llama3.1:8b`, `format=json`)
 
-**MCP tools used:**
+**MCP tools used (graphmcpserv):**
 - `get_relationships` — resolves Anomaly → DETECTED_ON → Node
 - `root_cause_analysis` — downstream graph traversal from affected node
 - `blast_radius` — count of services depending on the affected node
@@ -384,36 +513,38 @@ The supervisor is a **deterministic routing function** (no LLM calls). It reads 
 
 ### Phase 3 — Incident Mitigator (`agents/incident_mitigator.py`)
 
-**Model:** none (mock — prints to stdout)
+**Model:** none (deterministic)
 
-**Qdrant writes:** `feedback_history`
+**MCP tools used (mitigationmcpserv):** `execute_mitigation_step`, `check_mitigation_status`, `store_mitigation_feedback`
+
+**Qdrant writes:** `feedback_history` (via `store_mitigation_feedback`)
 
 **Logic:**
-1. Prints root cause hypotheses and matched workflows to stdout
-2. Simulates executing steps of the top workflow (`[simulated OK]`)
-3. Computes `confidence` = top workflow score (or max root-cause confidence if no workflows)
-4. **If** `confidence < CONFIDENCE_THRESHOLD` **and** `feedback_iteration < MAX_FEEDBACK_ITERATIONS`:
-   - Saves `{outcome="low_confidence", hypothesis, confidence, feedback_msg}` → `feedback_history`
+1. Prints root cause hypotheses and matched workflows
+2. Calls `execute_mitigation_step` for each step of the top workflow, tracking `run_id`
+3. Calls `check_mitigation_status(run_id)` to verify the run
+4. Computes `confidence` = top workflow score (or max root-cause confidence if no workflows)
+5. **If** `confidence < CONFIDENCE_THRESHOLD` **and** `feedback_iteration < MAX_FEEDBACK_ITERATIONS`:
+   - Calls `store_mitigation_feedback(outcome="low_confidence")` → Qdrant + log
    - Returns `phase="feedback"` with `feedback_request` message
-5. **Otherwise** (confident or max iterations reached):
-   - If prior feedback was used: saves `{outcome="resolved"}` → `feedback_history`
+6. **Otherwise** (confident or max iterations reached):
+   - If prior feedback was used: calls `store_mitigation_feedback(outcome="resolved")` → Qdrant + log
    - Returns `phase="communicate"`, `communication_event="mitigation_complete"`, `next_phase="summarize"`
 
-**Feedback history payload:**
+**Fallback:** if mitigationmcpserv tools are unavailable, falls back to direct Qdrant writes and prints steps without executing them.
+
+**Feedback history payload (stored via MCP):**
 
 ```json
 {
-  "outcome": "low_confidence" | "resolved",
   "incident_id": "INC-XXXXXXXX",
-  "severity": "SEV2",
-  "iteration": 1,
-  "confidence": 0.42,
-  "hypothesis": "Connection pool exhausted",
-  "node_id": "db-001",
-  "node_type": "Storage",
-  "workflow_title": "Restart DB Connection Pool",
-  "feedback_msg": "...",
-  "recorded_at": "2026-04-06T20:05:00Z"
+  "workflow_id": "WF-001",
+  "run_id": "abc123",
+  "outcome": "low_confidence" | "resolved",
+  "notes": "...",
+  "query_text": "Connection pool exhausted node db-001 type Storage",
+  "recorded_at": "2026-04-10T09:41:00Z",
+  "source": "mitigation-mcp"
 }
 ```
 
@@ -431,6 +562,7 @@ The supervisor is a **deterministic routing function** (no LLM calls). It reads 
    - Root cause hypotheses (ranked by confidence)
    - Mitigation workflows matched (with steps)
    - Confidence score and feedback loop count
+   - Communications sent (channels + events)
 2. Prints 📋 INCIDENT SUMMARY to stdout
 3. Upserts to Qdrant `incident_summaries` with rich payload (point ID = `uuid5("incident-summary:<incident_id>")`)
 4. Sets `phase="done"`, `incident_summary=<text>`
@@ -448,7 +580,7 @@ The supervisor is a **deterministic routing function** (no LLM calls). It reads 
   "workflow_count": 2,
   "mitigation_confidence": 0.83,
   "feedback_iterations": 1,
-  "completed_at": "2026-04-06T20:10:00Z"
+  "completed_at": "2026-04-10T09:45:00Z"
 }
 ```
 
@@ -471,13 +603,13 @@ autoincrespagent/
 │   │   ├── state.py                         # AgentState TypedDict (shared)
 │   │   ├── supervisor.py                    # Deterministic phase → node router
 │   │   ├── incident_detector.py             # Phase 1 — anomaly classification
-│   │   ├── incident_communicator.py         # Cross-phase — print + Qdrant upsert
+│   │   ├── incident_communicator.py         # Cross-phase — commsmcpserv dispatch
 │   │   ├── root_cause_finder.py             # Phase 2 — graph + RAG + LLM synthesis
-│   │   ├── incident_mitigator.py            # Phase 3 — mock execution + feedback save
+│   │   ├── incident_mitigator.py            # Phase 3 — mitigationmcpserv execution
 │   │   └── incident_summarizer.py           # Phase 5 — final summary + Qdrant upsert
 │   ├── graph/
-│   │   ├── mcp_client.py                    # MultiServerMCPClient factory
-│   │   └── workflow.py                      # StateGraph assembly
+│   │   ├── mcp_client.py                    # MultiServerMCPClient (3 servers)
+│   │   └── workflow.py                      # StateGraph assembly + tool routing
 │   ├── memory/
 │   │   └── mysql_saver.py                   # LangGraph BaseCheckpointSaver → MySQL
 │   └── vector/
@@ -492,9 +624,17 @@ autoincrespagent/
         ├── test_supervisor.py               # 12 routing tests
         ├── test_detector.py                 # 18 incident detector tests
         ├── test_root_cause_finder.py        # 17 root cause finder tests
-        ├── test_incident_mitigator.py       # 19 mitigator + feedback persistence tests
-        ├── test_incident_communicator.py    # 11 communicator tests
+        ├── test_incident_mitigator.py       # 31 mitigator + MCP + feedback tests
+        ├── test_incident_communicator.py    # 34 communicator + MCP + channel tests
         └── test_incident_summarizer.py      # 12 summarizer + Qdrant persistence tests
+```
+
+**Sibling MCP server packages (spawned as subprocesses):**
+
+```
+../graphmcpserv/        # 10 Neo4j tools — wraps graphserv REST API
+../mitigationmcpserv/   # 4 mitigation tools — workflow search + stub execution
+../commsmcpserv/        # 6 comms tools — email, Slack, Teams, SMS, PagerDuty, ticket
 ```
 
 ---
@@ -508,13 +648,13 @@ autoincrespagent/
 | `langchain-core` | ≥1.0 | Base types (BaseTool, messages, RunnableConfig) |
 | `langchain-ollama` | ≥1.0 | ChatOllama + OllamaEmbeddings |
 | `langchain-mcp-adapters` | ≥0.2 | Converts MCP tools → LangChain BaseTool |
-| `mcp` | ≥1.0 | MCP protocol SDK (spawns graphmcpserv subprocess) |
+| `mcp` | ≥1.0 | MCP protocol SDK (spawns MCP server subprocesses) |
 | `aiomysql` | ≥0.2 | Async MySQL driver for checkpoint saver |
 | `qdrant-client` | ≥1.7 | Async Qdrant vector search (`AsyncQdrantClient`) |
 | `pydantic-settings` | ≥2.0 | Environment variable loading |
 | `python-dotenv` | ≥1.0 | `.env` file support |
 
-**Also requires** `graphmcpserv` installed in the same Python environment — see [Setup](#setup).
+**MCP servers** run from their own source directories via `cwd` — no editable install into the agent venv required.
 
 ---
 
@@ -537,6 +677,9 @@ cp .env.example .env
 | `MYSQL_USER` | `ir_user` | MySQL username |
 | `MYSQL_PASSWORD` | *(empty)* | MySQL password |
 | `MYSQL_DATABASE` | `incident_response` | MySQL database name |
+| `GRAPHMCPSERV_PATH` | `../graphmcpserv` | Path to graphmcpserv source directory |
+| `MITIGATIONMCPSERV_PATH` | `../mitigationmcpserv` | Path to mitigationmcpserv source directory |
+| `COMMSMCPSERV_PATH` | `../commsmcpserv` | Path to commsmcpserv source directory |
 | `CONFIDENCE_THRESHOLD` | `0.75` | Mitigation confidence below which feedback loop triggers |
 | `MAX_FEEDBACK_ITERATIONS` | `3` | Max Mitigator ↔ Root Cause Finder cycles |
 | `POLL_INTERVAL_SECONDS` | `60` | Seconds between anomaly polls |
@@ -563,13 +706,14 @@ cd autoincrespagent
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install agent + graphmcpserv (MCP subprocess must share the same venv)
+# Install the agent package only — MCP servers run from their own directories
 pip install -e .
-pip install ../graphmcpserv
 
 cp .env.example .env
 # edit .env with your credentials
 ```
+
+> The three MCP servers (`graphmcpserv`, `mitigationmcpserv`, `commsmcpserv`) do **not** need to be installed into this venv. The agent spawns each one with `cwd` set to its source directory, so Python resolves the `mcp_servers.*` namespace directly from there.
 
 ### Apply MySQL schema
 
@@ -618,9 +762,14 @@ python trigger.py
 python trigger.py --poll
 ```
 
-### Inject a test anomaly
+The three MCP servers start automatically when `trigger.py` runs. You will see:
 
-If no anomalies are active, the detector exits at `phase=done`. Inject one first:
+```
+INFO:mcp.server.lowlevel.server:Processing request of type ListToolsRequest   (×3)
+INFO trigger: loaded 20 MCP tools: ['list_anomalies', ..., 'send_email', ...]
+```
+
+### Inject a test anomaly
 
 ```bash
 curl -X POST http://localhost:8080/anomalies \
@@ -640,53 +789,61 @@ curl -X POST http://localhost:8080/anomalies \
 ════════════════════════════════════════════════════════════════════════
   🚨  INCIDENT DECLARED
 ════════════════════════════════════════════════════════════════════════
-  Incident ID  :  INC-362A3B55
+  Incident ID  :  INC-17FEA9A4
   Severity     :  SEV2
   Anomalies    :  1 active
                   • latency_spike [high]
-  Reason       :  High latency on payment service affecting multiple users
-  Time         :  2026-04-06T20:05:00Z
+  Channels     :  send_slack, send_teams, send_email
   → Next       :  Root Cause Analysis
 ────────────────────────────────────────────────────────────────────────
+
+[SLACK] 🟠 INC-17FEA9A4 → #incidents | Incident Detected — INC-17FEA9A4 [SEV2]
+[TEAMS] INC-17FEA9A4 | Incident Detected — INC-17FEA9A4 [SEV2] [warning]
+[EMAIL] INC-17FEA9A4 → oncall@example.com | [SEV2] Incident Detected: INC-17FEA9A4
+[TICKET] INC-17FEA9A4 [incident_detected] channels=send_slack,send_teams,send_email
 
 ════════════════════════════════════════════════════════════════════════
   🔍  ROOT CAUSE IDENTIFIED
 ════════════════════════════════════════════════════════════════════════
-  Incident ID  :  INC-362A3B55  [SEV2]
+  Incident ID  :  INC-17FEA9A4  [SEV2]
   Top Cause    :  Connection pool exhausted on payment-db
   Node         :  payment-db-001 (Storage)
   Confidence   :  88%
-  Workflows    :  3 matching workflow(s) in vector DB
+  Workflows    :  3 matching workflow(s)
+  Channels     :  send_slack, send_teams, send_email
   → Next       :  Mitigation
 ────────────────────────────────────────────────────────────────────────
 
   ────────────────────────────────────────────────────────────────────────
-  INCIDENT MITIGATOR  —  INC-362A3B55  [SEV2]
+  INCIDENT MITIGATOR  —  INC-17FEA9A4  [SEV2]
   ...
   [CONFIDENCE]  0.87  (threshold: 0.75)
-  [MOCK EXECUTION — top workflow]
-    ✓ step 1: Confirm active connection count ...  [simulated OK]
-    ✓ step 2: Identify top connection consumers ... [simulated OK]
-  ...
+  [EXECUTING — WF-001: Restart DB Connection Pool]
+    step 1: Check active connection count  [completed]
+    step 2: Increase max_connections       [completed]
+    step 3: Restart application pods       [completed]
+    Run abc-123: 3/3 steps completed
 
 ════════════════════════════════════════════════════════════════════════
   🔧  MITIGATION EXECUTED
 ════════════════════════════════════════════════════════════════════════
-  Incident ID  :  INC-362A3B55  [SEV2]
+  Incident ID  :  INC-17FEA9A4  [SEV2]
   Workflow     :  WF-001 — Restart DB Connection Pool
   Confidence   :  0.87
+  Channels     :  send_slack, send_teams, send_email
   → Next       :  Incident Summarization
 ────────────────────────────────────────────────────────────────────────
+```
 
-════════════════════════════════════════════════════════════════════════
-  📋  INCIDENT SUMMARY
-════════════════════════════════════════════════════════════════════════
-  INCIDENT SUMMARY — INC-362A3B55 [SEV2]
-  Anomalies detected: 1 ...
-  Root cause hypotheses: 3 ...
-  Mitigation confidence: 0.87
-  ...
-────────────────────────────────────────────────────────────────────────
+### Comms log files
+
+After a run, check what was "sent":
+
+```bash
+cat logs/slack_outbox.log   | python3 -m json.tool
+cat logs/email_outbox.log   | python3 -m json.tool
+cat logs/ticket_comms.log   | python3 -m json.tool
+cat logs/mitigation_runs.log | python3 -m json.tool
 ```
 
 ### Force feedback loop (for testing)
@@ -697,8 +854,6 @@ CONFIDENCE_THRESHOLD=0.99
 
 python trigger.py
 # mitigator will request feedback 1–3 times before advancing
-# check Qdrant feedback_history after run:
-curl http://localhost:6333/collections/feedback_history | python3 -m json.tool
 ```
 
 ### Fallback behaviour
@@ -708,6 +863,9 @@ curl http://localhost:6333/collections/feedback_history | python3 -m json.tool
 | MySQL | Falls back to in-memory checkpointer — no persistence |
 | Qdrant | Vector search skipped gracefully — agents still run |
 | graphserv | Detector logs error and exits cleanly with `phase=done` |
+| mitigationmcpserv unavailable | Mitigator falls back to direct Qdrant writes + print-only execution |
+| commsmcpserv unavailable | Communicator falls back to print-only mode |
+| Individual comms tool fails | Remaining channels still dispatch (partial failure resilience) |
 | LLM bad JSON | Treated as no-incident (detector) / empty hypotheses (RCA) |
 
 ---
@@ -726,14 +884,14 @@ pytest tests/unit/ -v
 | `test_supervisor.py` | 12 | All phase → node routing, unknown/empty/missing phase → END |
 | `test_detector.py` | 18 | No anomalies, no incident, incident declared, error handling |
 | `test_root_cause_finder.py` | 17 | Factory, graph traversal, Qdrant search (5 collections), feedback |
-| `test_incident_mitigator.py` | 19 | Confidence routing, feedback loop, Qdrant feedback persistence |
-| `test_incident_communicator.py` | 11 | All 3 event banners, next_phase routing, Qdrant upsert |
+| `test_incident_mitigator.py` | 31 | Confidence routing, MCP execution, feedback via MCP + direct Qdrant fallback |
+| `test_incident_communicator.py` | 34 | Channel selection (SEV1-4), tool args, communications_sent, graceful degradation |
 | `test_incident_summarizer.py` | 12 | Summary content, Qdrant persistence, deterministic point ID |
-| **Total** | **89** | |
+| **Total** | **124** | |
 
 ### Unit test approach
 
-- MCP tools mocked with `unittest.mock.AsyncMock` — no running graphserv needed
+- MCP tools mocked with `unittest.mock.AsyncMock` — no running servers needed
 - LLM injected via `make_<agent>(tools, llm=fake_llm)` — no Ollama needed
 - Qdrant client mocked — `client.query_points`, `client.upsert`, `client.get_collections`
 - All tests run offline in < 1 second

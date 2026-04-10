@@ -31,6 +31,7 @@ def build_mcp_client() -> MultiServerMCPClient:
             "command": "python",
             "args": ["-m", "mcp_servers.graph_db.server"],
             "transport": "stdio",
+            "cwd": settings.graphmcpserv_path,
             "env": {
                 "GRAPHSERV_URL": settings.graphserv_url,
                 "GRAPHSERV_TIMEOUT": "10.0",

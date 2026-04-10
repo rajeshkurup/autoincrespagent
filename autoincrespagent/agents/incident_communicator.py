@@ -74,12 +74,22 @@ def _get_tool(tools: list, name: str):
 
 
 async def _call_tool(tools: list, name: str, args: dict) -> dict | None:
-    """Invoke a comms MCP tool and parse the JSON response. Returns None on failure."""
+    """Invoke a comms MCP tool and parse the JSON response. Returns None on failure.
+
+    langchain-mcp-adapters may return a list of content objects, a plain string,
+    or already-parsed dict depending on the adapter version — handle all cases.
+    """
     tool = _get_tool(tools, name)
     if not tool:
         return None
     try:
         raw = await tool.ainvoke(args)
+        # Unwrap list[TextContent] → str
+        if isinstance(raw, list):
+            first = raw[0]
+            raw = first.text if hasattr(first, "text") else (
+                first.get("text", str(first)) if isinstance(first, dict) else str(first)
+            )
         return json.loads(raw) if isinstance(raw, str) else raw
     except Exception as exc:
         logger.warning(f"incident_communicator: tool '{name}' failed — {exc}")

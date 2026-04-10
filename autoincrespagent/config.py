@@ -19,7 +19,9 @@ class Settings(BaseSettings):
     mysql_password: str = ""
     mysql_database: str = "incident_response"
 
-    # MCP server paths
+    # MCP server paths (each server runs from its own source directory so
+    # Python resolves mcp_servers.* from that tree — no editable install needed)
+    graphmcpserv_path: str = "../graphmcpserv"
     mitigationmcpserv_path: str = "../mitigationmcpserv"
     commsmcpserv_path: str = "../commsmcpserv"
 

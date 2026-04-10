@@ -2,6 +2,8 @@
 
 AI-driven incident response agent built with LangGraph and Ollama. Monitors infrastructure anomalies via the [graphserv](../graphserv/README.md) topology graph, classifies them into incidents, and orchestrates a multi-agent pipeline to root-cause, mitigate, communicate, and summarize them.
 
+See **[CHANGELOG](../CHANGELOG.md)** for a full history of changes across all repos in this project.
+
 ---
 
 ## Table of Contents
